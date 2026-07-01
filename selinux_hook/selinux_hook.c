@@ -2149,6 +2149,7 @@ static bool enter_clean_eval_scope(void)
     int i;
     u32 depth;
     bool entered = false;
+    bool needs_unlock = (g_raw_spin_lock_fn != NULL);
 
     if (!clean_policydb_redirect_supported())
         return false;
@@ -2171,8 +2172,8 @@ static bool enter_clean_eval_scope(void)
 
     if (!entered) {
         if (empty < 0) {
-            if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
+            if (needs_unlock && g_raw_spin_unlock_fn)
+                g_raw_spin_unlock_fn(&g_scopes_lock);
             pr_warn("[selinux_hook] clean eval scope slots exhausted task=%px comm=%s\n",
                     task, current_comm());
             return false;
@@ -2182,7 +2183,7 @@ static bool enter_clean_eval_scope(void)
         WRITE_ONCE(g_clean_eval_depth, READ_ONCE(g_clean_eval_depth) + 1);
         entered = true;
     }
-    if (g_raw_spin_unlock_fn)
+    if (needs_unlock && g_raw_spin_unlock_fn)
         g_raw_spin_unlock_fn(&g_scopes_lock);
     return true;
 }
@@ -2192,6 +2193,7 @@ static void leave_clean_eval_scope(void)
     void *task = current;
     int i;
     u32 depth;
+    bool needs_unlock = (g_raw_spin_lock_fn != NULL);
 
     if (g_raw_spin_lock_fn)
         g_raw_spin_lock_fn(&g_scopes_lock);
@@ -2208,11 +2210,11 @@ static void leave_clean_eval_scope(void)
         }
         if (READ_ONCE(g_clean_eval_depth))
             WRITE_ONCE(g_clean_eval_depth, READ_ONCE(g_clean_eval_depth) - 1);
-        if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
+        if (needs_unlock && g_raw_spin_unlock_fn)
+            g_raw_spin_unlock_fn(&g_scopes_lock);
         return;
     }
-    if (g_raw_spin_unlock_fn)
+    if (needs_unlock && g_raw_spin_unlock_fn)
         g_raw_spin_unlock_fn(&g_scopes_lock);
 }
 
@@ -2221,6 +2223,7 @@ static bool current_in_clean_eval_scope(void)
     void *task = current;
     int i;
     bool in_scope = false;
+    bool needs_unlock = (g_raw_spin_lock_fn != NULL);
 
     if (g_raw_spin_lock_fn)
         g_raw_spin_lock_fn(&g_scopes_lock);
@@ -2231,7 +2234,7 @@ static bool current_in_clean_eval_scope(void)
             break;
         }
     }
-    if (g_raw_spin_unlock_fn)
+    if (needs_unlock && g_raw_spin_unlock_fn)
         g_raw_spin_unlock_fn(&g_scopes_lock);
     return in_scope;
 }
@@ -2243,6 +2246,7 @@ static bool enter_status_read_scope(void)
     int i;
     u32 depth;
     bool entered = false;
+    bool needs_unlock = (g_raw_spin_lock_fn != NULL);
 
     if (g_raw_spin_lock_fn)
         g_raw_spin_lock_fn(&g_scopes_lock);
@@ -2259,8 +2263,8 @@ static bool enter_status_read_scope(void)
 
     if (!entered) {
         if (empty < 0) {
-            if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
+            if (needs_unlock && g_raw_spin_unlock_fn)
+                g_raw_spin_unlock_fn(&g_scopes_lock);
             pr_warn("[selinux_hook] status read scope slots exhausted task=%px comm=%s\n",
                     task, current_comm());
             return false;
@@ -2270,7 +2274,7 @@ static bool enter_status_read_scope(void)
         g_status_read_scopes[empty].patched = 0;
         entered = true;
     }
-    if (g_raw_spin_unlock_fn)
+    if (needs_unlock && g_raw_spin_unlock_fn)
         g_raw_spin_unlock_fn(&g_scopes_lock);
     return true;
 }
@@ -2280,6 +2284,7 @@ static void leave_status_read_scope(void)
     void *task = current;
     int i;
     u32 depth;
+    bool needs_unlock = (g_raw_spin_lock_fn != NULL);
 
     if (g_raw_spin_lock_fn)
         g_raw_spin_lock_fn(&g_scopes_lock);
@@ -2295,11 +2300,11 @@ static void leave_status_read_scope(void)
             g_status_read_scopes[i].patched = 0;
             g_status_read_scopes[i].task = NULL;
         }
-        if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
+        if (needs_unlock && g_raw_spin_unlock_fn)
+            g_raw_spin_unlock_fn(&g_scopes_lock);
         return;
     }
-    if (g_raw_spin_unlock_fn)
+    if (needs_unlock && g_raw_spin_unlock_fn)
         g_raw_spin_unlock_fn(&g_scopes_lock);
 }
 
@@ -2308,6 +2313,7 @@ static bool current_in_status_read_scope(void)
     void *task = current;
     int i;
     bool in_scope = false;
+    bool needs_unlock = (g_raw_spin_lock_fn != NULL);
 
     if (g_raw_spin_lock_fn)
         g_raw_spin_lock_fn(&g_scopes_lock);
@@ -2318,7 +2324,7 @@ static bool current_in_status_read_scope(void)
             break;
         }
     }
-    if (g_raw_spin_unlock_fn)
+    if (needs_unlock && g_raw_spin_unlock_fn)
         g_raw_spin_unlock_fn(&g_scopes_lock);
     return in_scope;
 }
@@ -2327,6 +2333,7 @@ static void mark_status_read_scope_patched(void)
 {
     void *task = current;
     int i;
+    bool needs_unlock = (g_raw_spin_lock_fn != NULL);
 
     if (g_raw_spin_lock_fn)
         g_raw_spin_lock_fn(&g_scopes_lock);
@@ -2334,12 +2341,12 @@ static void mark_status_read_scope_patched(void)
         if (g_status_read_scopes[i].task == task &&
             g_status_read_scopes[i].depth) {
             g_status_read_scopes[i].patched = 1;
-            if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
+            if (needs_unlock && g_raw_spin_unlock_fn)
+                g_raw_spin_unlock_fn(&g_scopes_lock);
             return;
         }
     }
-    if (g_raw_spin_unlock_fn)
+    if (needs_unlock && g_raw_spin_unlock_fn)
         g_raw_spin_unlock_fn(&g_scopes_lock);
 }
 
@@ -2348,6 +2355,7 @@ static bool current_status_read_scope_patched(void)
     void *task = current;
     int i;
     bool patched = false;
+    bool needs_unlock = (g_raw_spin_lock_fn != NULL);
 
     if (g_raw_spin_lock_fn)
         g_raw_spin_lock_fn(&g_scopes_lock);
@@ -2358,7 +2366,7 @@ static bool current_status_read_scope_patched(void)
             break;
         }
     }
-    if (g_raw_spin_unlock_fn)
+    if (needs_unlock && g_raw_spin_unlock_fn)
         g_raw_spin_unlock_fn(&g_scopes_lock);
     return patched;
 }
@@ -2453,6 +2461,7 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
     if (!READ_ONCE(g_first_policydb)) {
         WRITE_ONCE(g_first_policydb, policydb);
         selinux_hook_dbg("[selinux_hook] SAVED first policydb @ %px\n", g_first_policydb);
+        /* 关键修复：确保在安全上下文中调用 refresh 和 snapshot */
         refresh_clean_policydb("first_compute_av", false);
         snapshot_clean_policy("first_compute_av");
         return;
@@ -2521,6 +2530,13 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
 
     clean_pdb = (struct policydb *)READ_ONCE(g_clean_policydb);
     if (clean_pdb && !READ_ONCE(g_clean_policydb_av_disabled)) {
+        /* 关键修复：检查核心函数指针是否可用 */
+        if (!flex_array_get_fn || !avtab_search_node_fn || !avtab_search_node_next_fn) {
+            pr_warn("[selinux_hook] legacy intel_av missing core helpers, skipping clean policydb\n");
+            WRITE_ONCE(g_clean_policydb_av_disabled, true);
+            goto skip_clean;
+        }
+
         scontext = (struct context *)a->arg0;
         tcontext = (struct context *)a->arg1;
         tclass = (u16)a->arg2;
@@ -2541,6 +2557,7 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
                 kver, clean_pdb, tclass);
     }
 
+skip_clean:
     if (!READ_ONCE(g_selinux_ready)) {
         WRITE_ONCE(g_selinux_ready, true);
         selinux_hook_dbg("[selinux_hook] SELinux ready inferred from legacy context_struct_compute_av\n");
