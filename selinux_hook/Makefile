@@ -23,7 +23,9 @@ else ifdef NDK_PATH
     LD := $(NDK_PATH)/ld.lld
 endif
 
-CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-common -fno-builtin-strlen -DSELINUX_VERSION=\"$(SELINUX_VERSION)\"
+CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-common
+CFLAGS += -fno-builtin-strlen -fno-builtin-memcpy
+CFLAGS += -DSELINUX_VERSION=\"$(SELINUX_VERSION)\"
 CFLAGS += -std=gnu99
 
 INCLUDE_DIRS := . include patch/include linux linux/include linux/security/selinux/include linux/arch/arm64/include linux/tools/arch/arm64/include
