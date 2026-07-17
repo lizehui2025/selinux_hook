@@ -625,8 +625,8 @@ static ssize_t patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
 static void copy_bytes(void *dst, const void *src, size_t len)
 {
     size_t i;
-    char *d = (char *)dst;
-    const char *s = (const char *)src;
+    volatile char *d = (volatile char *)dst;
+    const volatile char *s = (const volatile char *)src;
 
     if (!d || !s)
         return;
@@ -3940,9 +3940,14 @@ static void after_sel_read_handle_status(hook_fargs4_t *a, void *u)
                      SELINUX_STATUS_CLEAN_POLICYLOAD);
 }
 
+#define STATUS_SAVED_OFFSET 0
+#define STATUS_FROM_PTR_OFFSET 3
+#define STATUS_SAVED_SLOTS 3
+
 static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u)
 {
     unsigned char *from;
+    unsigned char saved[SELINUX_STATUS_SIZE];
     u32 n;
 
     a->local.data0 = 0;
@@ -3956,12 +3961,15 @@ static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u)
     if (!from)
         return;
 
-    copy_bytes(&a->local.data2, from, sizeof(g_clean_status_bytes));
+    copy_bytes(saved, from, sizeof(g_clean_status_bytes));
     copy_bytes(from, g_clean_status_bytes, sizeof(g_clean_status_bytes));
     mark_status_read_scope_patched();
 
     a->local.data0 = 1;
-    a->local.data1 = (uint64_t)from;
+    /* Stash saved[] in data[0..2] (24 bytes, big enough for 20-byte status) */
+    copy_bytes(&a->local.data[STATUS_SAVED_OFFSET], saved, sizeof(g_clean_status_bytes));
+    /* Stash the original 'from' pointer (needed for the restore below) */
+    a->local.data[STATUS_FROM_PTR_OFFSET] = (uint64_t)from;
 
     n = READ_ONCE(g_status_redirect_count) + 1;
     WRITE_ONCE(g_status_redirect_count, n);
@@ -3970,11 +3978,11 @@ static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u)
                 n, current_uid(), current_comm(), (void *)a->arg0,
                 (size_t)a->arg1, (void *)a->arg2, from,
                 (size_t)a->arg4,
-                get_u32_le((unsigned char *)&a->local.data2 + 0),
-                get_u32_le((unsigned char *)&a->local.data2 + 4),
-                get_u32_le((unsigned char *)&a->local.data2 + 8),
-                get_u32_le((unsigned char *)&a->local.data2 + 12),
-                get_u32_le((unsigned char *)&a->local.data2 + 16),
+                get_u32_le(saved + 0),
+                get_u32_le(saved + 4),
+                get_u32_le(saved + 8),
+                get_u32_le(saved + 12),
+                get_u32_le(saved + 16),
                 get_u32_le(g_clean_status_bytes + 0),
                 get_u32_le(g_clean_status_bytes + 4),
                 get_u32_le(g_clean_status_bytes + 8),
@@ -3986,16 +3994,19 @@ static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u)
 
 static void after_simple_read_from_buffer(hook_fargs5_t *a, void *u)
 {
+    unsigned char saved[SELINUX_STATUS_SIZE];
     unsigned char *from;
 
     if (!a->local.data0)
         return;
 
-    from = (unsigned char *)a->local.data1;
+    /* Restore saved[] from data[0..2] (stashed by before hook) */
+    copy_bytes(saved, &a->local.data[STATUS_SAVED_OFFSET], sizeof(g_clean_status_bytes));
+    from = (unsigned char *)a->local.data[STATUS_FROM_PTR_OFFSET];
     if (!from)
         return;
 
-    copy_bytes(from, &a->local.data2, sizeof(g_clean_status_bytes));
+    copy_bytes(from, saved, sizeof(g_clean_status_bytes));
 }
 
 static void before_security_read_policy_common(hook_fargs4_t *a, void **out_data,

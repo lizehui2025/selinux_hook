@@ -32,19 +32,30 @@ jobs:
           submodules: 'recursive'
           fetch-depth: 1
 
-      - name: Update system and install dependencies
+      - name: Install Compiler
         run: |
-          sudo apt update -y
-          sudo apt install llvm -y
+          mkdir -p .tools
+          curl -o .tools/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz \
+            https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -C .tools -Jxf .tools/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          rm -f .tools/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
 
       - name: Build kpm
+        env:
+          TARGET_COMPILE: ${{ github.workspace }}/.tools/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-
+          ANDROID: "1"
         run: |
-          mkdir target
-
-          for dir in $(ls -d */ | grep -v '^KernelPatch/$\|^target/$'); do
-            make -C ${dir}
-            mv ${dir}*.kpm target
+          mkdir -p target
+          shopt -s nullglob
+          for mk in */Makefile; do
+            dir=$(dirname "$mk")
+            make -C "$dir"
+            for kpm in "$dir"/*.kpm; do
+              [ -f "$kpm" ] || continue
+              mv -v "$kpm" "target/$(basename "$kpm")"
+            done
           done
+          shopt -u nullglob
 
       - name: Upload artifact
         if: success()
