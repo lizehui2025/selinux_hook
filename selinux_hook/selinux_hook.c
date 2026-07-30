@@ -15,6 +15,7 @@
 #include <linux/err.h>
 #include <asm/current.h>
 #include <asm-generic/rwonce.h>
+#include <barrier.h>
 #include <uapi/asm-generic/errno.h>
 #include <uapi/asm-generic/fcntl.h>
 #include <uapi/linux/fs.h>
@@ -437,7 +438,6 @@ static u32 g_bypass_access_log_count;
 static u32 g_bypass_context_log_count;
 
 static u32 g_bypass_policy_log_count;
-static u32 g_internal_policy_load_depth;
 static u32 g_procattr_current_count;
 static u32 g_setprocattr_probe_count;
 static u32 g_selinux_setprocattr_probe_count;
@@ -467,9 +467,15 @@ struct status_read_scope {
     u32 patched;
 };
 
+struct policy_load_scope {
+    void *task;
+    u32 depth;
+};
+
 static struct access_probe g_probes[ACCESS_PROBE_SLOTS];
 static struct clean_eval_scope g_clean_eval_scopes[CLEAN_EVAL_SCOPE_SLOTS];
 static struct status_read_scope g_status_read_scopes[STATUS_READ_SCOPE_SLOTS];
+static struct policy_load_scope g_policy_load_scopes[STATUS_READ_SCOPE_SLOTS];
 static unsigned char g_clean_status_bytes[SELINUX_STATUS_SIZE];
 
 /* Spinlock guards for the scope arrays.  We do not use DEFINE_SPINLOCK +
@@ -545,6 +551,9 @@ static bool current_status_read_scope_patched(void);
 static bool enter_clean_eval_scope(void);
 static void leave_clean_eval_scope(void);
 static bool current_in_clean_eval_scope(void);
+static void enter_policy_load_scope(void);
+static void leave_policy_load_scope(void);
+static bool current_in_policy_load_scope(void);
 static ssize_t hooked_sel_write_access(struct file *file, char *buf, size_t size);
 static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t size);
 static int install_write_op_hooks(void);
@@ -1860,9 +1869,12 @@ static bool try_snapshot_mock_policy(const char *reason)
         return false;
     }
 
-    WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, (size_t)len));
-    WRITE_ONCE(g_clean_policy_len, (size_t)len);
-    WRITE_ONCE(g_clean_policy_blob, data);
+    /* Publish len/has_magisk before the pointer so consumers that observe
+     * the new blob via smp_load_acquire() also observe matching metadata.
+     * Pairing: smp_load_acquire(&g_clean_policy_blob) at consumers. */
+    smp_store_release(&g_clean_policy_has_magisk, buffer_contains_magisk(data, (size_t)len));
+    smp_store_release(&g_clean_policy_len, (size_t)len);
+    smp_store_release(&g_clean_policy_blob, data);
     pr_info("[selinux_hook] CLEAN mock policy snapshot saved reason=%s path=%s blob=%px len=%zu has_magisk=%d\n",
             reason ?: "(null)", MAGISK_MOCK_POLICY_PATH, data,
             READ_ONCE(g_clean_policy_len), READ_ONCE(g_clean_policy_has_magisk));
@@ -1932,7 +1944,7 @@ static void try_load_clean_policydb_from_blob(const char *reason)
 {
     struct policy_file fp;
     struct policydb *policydb;
-    void *blob = READ_ONCE(g_clean_policy_blob);
+    void *blob = smp_load_acquire(&g_clean_policy_blob);
     size_t len = READ_ONCE(g_clean_policy_len);
     int rc;
 
@@ -2015,9 +2027,10 @@ static void snapshot_clean_policy(const char *reason)
         return;
     }
 
-    WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, len));
-    WRITE_ONCE(g_clean_policy_len, len);
-    WRITE_ONCE(g_clean_policy_blob, data);
+    /* Publish len/has_magisk before the pointer. See pairing note above. */
+    smp_store_release(&g_clean_policy_has_magisk, buffer_contains_magisk(data, len));
+    smp_store_release(&g_clean_policy_len, len);
+    smp_store_release(&g_clean_policy_blob, data);
     selinux_hook_dbg("[selinux_hook] CLEAN policy snapshot saved reason=%s blob=%px len=%zu has_magisk=%d\n",
                      reason ?: "(null)", data, len, READ_ONCE(g_clean_policy_has_magisk));
 
@@ -2046,12 +2059,9 @@ load_clean_policy:
 
     if ((security_load_policy_fn || security_load_policy_compat_fn) &&
         !READ_ONCE(g_clean_load_state_ready)) {
-        WRITE_ONCE(g_internal_policy_load_depth,
-                   READ_ONCE(g_internal_policy_load_depth) + 1);
+        enter_policy_load_scope();
         rc = call_security_load_policy(data, len, &g_clean_load_state);
-        if (READ_ONCE(g_internal_policy_load_depth))
-            WRITE_ONCE(g_internal_policy_load_depth,
-                       READ_ONCE(g_internal_policy_load_depth) - 1);
+        leave_policy_load_scope();
         if (!rc && g_clean_load_state.policy) {
             WRITE_ONCE(g_clean_load_state_ready, true);
             refresh_clean_policydb("clean_load", false);
@@ -2164,7 +2174,7 @@ static const char *skip_spaces(const char *s)
 
 static bool clean_blob_has_name(const char *name, size_t len)
 {
-    const char *blob = (const char *)READ_ONCE(g_clean_policy_blob);
+    const char *blob = (const char *)smp_load_acquire(&g_clean_policy_blob);
     size_t blob_len = READ_ONCE(g_clean_policy_len);
     size_t i;
 
@@ -2717,6 +2727,87 @@ static bool current_status_read_scope_patched(void)
     return patched;
 }
 
+/* Per-task tracking for "we are inside an internal policy load" so that
+ * hooks re-entering security_load_policy()/context_struct_compute_av() do
+ * not recurse and do not tamper with the live policydb mid-load.  The
+ * previous global counter g_internal_policy_load_depth could be disturbed
+ * by concurrent policy loads on different CPUs; per-task scoping is correct
+ * because a recursive entry can only happen from the same task. */
+static void enter_policy_load_scope(void)
+{
+    void *task = current;
+    int empty = -1;
+    int i;
+
+    if (g_raw_spin_lock_fn)
+        g_raw_spin_lock_fn(&g_scopes_lock);
+    for (i = 0; i < STATUS_READ_SCOPE_SLOTS; i++) {
+        if (g_policy_load_scopes[i].task == task) {
+            g_policy_load_scopes[i].depth++;
+            if (g_raw_spin_unlock_fn)
+                g_raw_spin_unlock_fn(&g_scopes_lock);
+            return;
+        }
+        if (empty < 0 && !g_policy_load_scopes[i].task)
+            empty = i;
+    }
+    if (empty < 0) {
+        if (g_raw_spin_unlock_fn)
+            g_raw_spin_unlock_fn(&g_scopes_lock);
+        pr_warn("[selinux_hook] policy load scope slots exhausted task=%px comm=%s\n",
+                task, current_comm());
+        return;
+    }
+    g_policy_load_scopes[empty].task = task;
+    g_policy_load_scopes[empty].depth = 1;
+    if (g_raw_spin_unlock_fn)
+        g_raw_spin_unlock_fn(&g_scopes_lock);
+}
+
+static void leave_policy_load_scope(void)
+{
+    void *task = current;
+    int i;
+
+    if (g_raw_spin_lock_fn)
+        g_raw_spin_lock_fn(&g_scopes_lock);
+    for (i = 0; i < STATUS_READ_SCOPE_SLOTS; i++) {
+        if (g_policy_load_scopes[i].task != task)
+            continue;
+        if (g_policy_load_scopes[i].depth > 1) {
+            g_policy_load_scopes[i].depth--;
+        } else {
+            g_policy_load_scopes[i].depth = 0;
+            g_policy_load_scopes[i].task = NULL;
+        }
+        if (g_raw_spin_unlock_fn)
+            g_raw_spin_unlock_fn(&g_scopes_lock);
+        return;
+    }
+    if (g_raw_spin_unlock_fn)
+        g_raw_spin_unlock_fn(&g_scopes_lock);
+}
+
+static bool current_in_policy_load_scope(void)
+{
+    void *task = current;
+    int i;
+    bool in_scope = false;
+
+    if (g_raw_spin_lock_fn)
+        g_raw_spin_lock_fn(&g_scopes_lock);
+    for (i = 0; i < STATUS_READ_SCOPE_SLOTS; i++) {
+        if (g_policy_load_scopes[i].task == task &&
+            g_policy_load_scopes[i].depth) {
+            in_scope = true;
+            break;
+        }
+    }
+    if (g_raw_spin_unlock_fn)
+        g_raw_spin_unlock_fn(&g_scopes_lock);
+    return in_scope;
+}
+
 static int clean_policy_context_to_sid(const char *query, u32 *out_sid)
 {
     const char *ctx;
@@ -2842,7 +2933,7 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
     if (!clean_policydb_redirect_supported())
         return;
 
-    if (READ_ONCE(g_internal_policy_load_depth) ||   // 模块内部加载
+    if (current_in_policy_load_scope() ||   // 模块内部加载
         current_is_policy_manager()) {                // magiskpolicy 等
         return;  // 完全跳过，使用原始 policydb
     }
@@ -2933,7 +3024,7 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
     struct extended_perms *xperms;
     struct av_decision clean_avd;
 
-    if (READ_ONCE(g_internal_policy_load_depth) || current_is_policy_manager())
+    if (current_in_policy_load_scope() || current_is_policy_manager())
         return;
 
     clean_pdb = (struct policydb *)READ_ONCE(g_clean_policydb);
@@ -4151,7 +4242,7 @@ after_simple_read_from_buffer(hook_fargs5_t *a, void *u)
 static void before_security_read_policy_common(hook_fargs4_t *a, void **out_data,
                                                size_t *out_len)
 {
-    void *snapshot = READ_ONCE(g_clean_policy_blob);
+    void *snapshot = smp_load_acquire(&g_clean_policy_blob);
     size_t len = READ_ONCE(g_clean_policy_len);
     void *copy;
     u32 n;
@@ -4220,14 +4311,16 @@ static long init(const char *args, const char *event, void *__user r)
     resolve_required_symbols_once();
 
     /* Raw spinlock helpers — kfunc wrappers are not exported on this kernel,
-     * so resolve through kallsyms and call via function pointer.  The locks
-     * become no-ops if resolution fails, which is acceptable for these
-     * scope arrays (they only see per-task scope entry/exit pairs that
-     * are also serialized against themselves). */
+     * so resolve through kallsyms and call via function pointer.  When
+     * resolution fails the lock helpers become no-ops and the scope/cache
+     * arrays become UNSAFE under SMP concurrency: distinct CPUs may claim the
+     * same free slot and overwrite each other's per-task scope.  Log this
+     * condition loudly so device logs surface the risk. */
     g_raw_spin_lock_fn = (raw_spin_lock_fn_t)lookup_name_optional_suffix("_raw_spin_lock");
     g_raw_spin_unlock_fn = (raw_spin_unlock_fn_t)lookup_name_optional_suffix("_raw_spin_unlock");
     if (!g_raw_spin_lock_fn || !g_raw_spin_unlock_fn)
-        pr_warn("[selinux_hook] raw_spin_lock/unlock unresolved: lock=%px unlock=%px; scope/cache lock will be a no-op\n",
+        pr_warn("[selinux_hook] raw_spin_lock helpers unresolved lock=%px unlock=%px "
+                "- scope/cache arrays will be SMP-UNSAFE under concurrent access\n",
                 g_raw_spin_lock_fn, g_raw_spin_unlock_fn);
 
     copy_from_kernel_nofault_fn = (void *)lookup_name_optional_suffix("copy_from_kernel_nofault");
@@ -4338,12 +4431,15 @@ static long init(const char *args, const char *event, void *__user r)
             int argc = selinux_compat_call_needed() ? 3 : 2;
 
             pr_info("[selinux_hook] hook security_read_policy argc=%d\n", argc);
-            if (selinux_compat_call_needed())
-                install_inline_hook((void *)security_read_policy_fn, 3,
-                                    before_security_read_policy_compat, NULL);
-            else
-                install_inline_hook((void *)security_read_policy_fn, 2,
-                                    before_security_read_policy, NULL);
+            if (selinux_compat_call_needed()) {
+                if (install_inline_hook((void *)security_read_policy_fn, 3,
+                                        before_security_read_policy_compat, NULL) < 0)
+                    pr_warn("[selinux_hook] security_read_policy compat hook failed\n");
+            } else {
+                if (install_inline_hook((void *)security_read_policy_fn, 2,
+                                        before_security_read_policy, NULL) < 0)
+                    pr_warn("[selinux_hook] security_read_policy hook failed\n");
+            }
         } else {
             pr_info("[selinux_hook] skip security_read_policy hook on 4.9: helper ABI is device-specific\n");
         }
@@ -4354,8 +4450,9 @@ static long init(const char *args, const char *event, void *__user r)
     addr = (unsigned long)lookup_name_optional_suffix("sel_read_handle_status");
     if (addr) {
         selinux_hook_dbg("[selinux_hook] hook sel_read_handle_status argc=4\n");
-        install_inline_hook((void *)addr, 4, before_sel_read_handle_status,
-                            after_sel_read_handle_status);
+        if (install_inline_hook((void *)addr, 4, before_sel_read_handle_status,
+                                after_sel_read_handle_status) < 0)
+            pr_warn("[selinux_hook] sel_read_handle_status hook failed\n");
     } else {
         pr_warn("[selinux_hook] cannot find sel_read_handle_status, status read hook skipped\n");
     }
@@ -4364,7 +4461,8 @@ static long init(const char *args, const char *event, void *__user r)
     addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
     if (addr) {
         selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2\n");
-        install_inline_hook((void *)addr, 2, NULL, after_sel_mmap_handle_status);
+        if (install_inline_hook((void *)addr, 2, NULL, after_sel_mmap_handle_status) < 0)
+            pr_warn("[selinux_hook] sel_mmap_handle_status hook failed\n");
     } else {
         pr_warn("[selinux_hook] cannot find sel_mmap_handle_status, status mmap patch skipped\n");
     }
@@ -4375,8 +4473,9 @@ static long init(const char *args, const char *event, void *__user r)
         /* argc=1 on < 5.19 (state arg), argc=0 on >= 5.19 */
         int argc = (kver < VERSION(5, 19, 0)) ? 1 : 0;
         selinux_hook_dbg("[selinux_hook] hook selinux_status_update_seqlock argc=%d kver=%x\n", argc, kver);
-        install_inline_hook((void *)addr, argc,
-                            before_selinux_status_update_seqlock, NULL);
+        if (install_inline_hook((void *)addr, argc,
+                                before_selinux_status_update_seqlock, NULL) < 0)
+            pr_warn("[selinux_hook] selinux_status_update_seqlock hook failed\n");
     } else {
         pr_warn("[selinux_hook] cannot find selinux_status_update_seqlock\n");
     }
@@ -4386,8 +4485,9 @@ static long init(const char *args, const char *event, void *__user r)
         /* argc=2 on < 5.19 (state, seqno), argc=1 on >= 5.19 (seqno) */
         int argc = (kver < VERSION(5, 19, 0)) ? 2 : 1;
         selinux_hook_dbg("[selinux_hook] hook selinux_status_update_policyload argc=%d kver=%x\n", argc, kver);
-        install_inline_hook((void *)addr, argc,
-                            before_selinux_status_update_policyload, NULL);
+        if (install_inline_hook((void *)addr, argc,
+                                before_selinux_status_update_policyload, NULL) < 0)
+            pr_warn("[selinux_hook] selinux_status_update_policyload hook failed\n");
     } else {
         pr_warn("[selinux_hook] cannot find selinux_status_update_policyload\n");
     }
@@ -4403,23 +4503,28 @@ static long init(const char *args, const char *event, void *__user r)
     if (addr) {
         if (selinux_49_compat_path()) {
             selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=4 mode=task 4.9\n");
-            install_inline_hook((void *)addr, 4,
-                                before_security_setprocattr_task_49, NULL);
+            if (install_inline_hook((void *)addr, 4,
+                                    before_security_setprocattr_task_49, NULL) < 0)
+                pr_warn("[selinux_hook] security_setprocattr task-4.9 hook failed\n");
         } else if (security_setprocattr_has_lsmid_arg()) {
             selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=4 mode=lsmid\n");
-            install_inline_hook((void *)addr, 4,
-                                before_security_setprocattr_lsmid, NULL);
+            if (install_inline_hook((void *)addr, 4,
+                                    before_security_setprocattr_lsmid, NULL) < 0)
+                pr_warn("[selinux_hook] security_setprocattr lsmid hook failed\n");
         } else {
             bool setprocattr_lsm_arg = security_setprocattr_has_lsm_arg();
 
             selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=%d\n",
                              setprocattr_lsm_arg ? 4 : 3);
-            if (setprocattr_lsm_arg)
-                install_inline_hook((void *)addr, 4,
-                                    before_security_setprocattr, NULL);
-            else
-                install_inline_hook((void *)addr, 3,
-                                    before_security_setprocattr_legacy, NULL);
+            if (setprocattr_lsm_arg) {
+                if (install_inline_hook((void *)addr, 4,
+                                        before_security_setprocattr, NULL) < 0)
+                    pr_warn("[selinux_hook] security_setprocattr lsm hook failed\n");
+            } else {
+                if (install_inline_hook((void *)addr, 3,
+                                        before_security_setprocattr_legacy, NULL) < 0)
+                    pr_warn("[selinux_hook] security_setprocattr legacy hook failed\n");
+            }
         }
     } else {
         pr_warn("[selinux_hook] cannot find security_setprocattr\n");
@@ -4429,12 +4534,14 @@ static long init(const char *args, const char *event, void *__user r)
     if (addr) {
         if (selinux_49_compat_path()) {
             selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=4 mode=task 4.9\n");
-            install_inline_hook((void *)addr, 4,
-                                before_selinux_setprocattr_task_49, NULL);
+            if (install_inline_hook((void *)addr, 4,
+                                    before_selinux_setprocattr_task_49, NULL) < 0)
+                pr_warn("[selinux_hook] selinux_setprocattr task-4.9 hook failed\n");
         } else {
             selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3\n");
-            install_inline_hook((void *)addr, 3,
-                                before_selinux_setprocattr, NULL);
+            if (install_inline_hook((void *)addr, 3,
+                                    before_selinux_setprocattr, NULL) < 0)
+                pr_warn("[selinux_hook] selinux_setprocattr hook failed\n");
         }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_setprocattr\n");
@@ -4465,13 +4572,15 @@ static long init(const char *args, const char *event, void *__user r)
             pr_info("[selinux_hook] skip context_struct_compute_av on 4.9: helper ABI is device-specific\n");
         } else if (clean_policydb_redirect_supported()) {
             pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
-            install_inline_hook((void *)addr, 6,
-                                before_context_struct_compute_av_policydb,
-                                after_context_struct_compute_av_policydb);
+            if (install_inline_hook((void *)addr, 6,
+                                    before_context_struct_compute_av_policydb,
+                                    after_context_struct_compute_av_policydb) < 0)
+                pr_warn("[selinux_hook] context_struct_compute_av policydb hook failed\n");
         } else {
             pr_info("[selinux_hook] hook legacy context_struct_compute_av argc=5\n");
-            install_inline_hook((void *)addr, 5,
-                                before_context_struct_compute_av_legacy, NULL);
+            if (install_inline_hook((void *)addr, 5,
+                                    before_context_struct_compute_av_legacy, NULL) < 0)
+                pr_warn("[selinux_hook] context_struct_compute_av legacy hook failed\n");
         }
     } else {
         pr_warn("[selinux_hook] cannot find context_struct_compute_av\n");
@@ -4483,7 +4592,8 @@ static long init(const char *args, const char *event, void *__user r)
             pr_info("[selinux_hook] skip string_to_context_struct on 4.9: helper ABI is device-specific\n");
         } else if (clean_policydb_redirect_supported()) {
             pr_info("[selinux_hook] hook string_to_context_struct argc=5\n");
-            install_inline_hook((void *)addr, 5, before_policydb_arg0, NULL);
+            if (install_inline_hook((void *)addr, 5, before_policydb_arg0, NULL) < 0)
+                pr_warn("[selinux_hook] string_to_context_struct hook failed\n");
         } else {
             pr_info("[selinux_hook] skip legacy string_to_context_struct policydb redirect\n");
         }
@@ -4497,8 +4607,9 @@ static long init(const char *args, const char *event, void *__user r)
             pr_info("[selinux_hook] skip selinux_complete_init on 4.9: helper ABI is device-specific\n");
         } else {
             pr_info("[selinux_hook] hook selinux_complete_init argc=0\n");
-            install_inline_hook((void *)addr, 0, NULL,
-                                after_selinux_complete_init);
+            if (install_inline_hook((void *)addr, 0, NULL,
+                                    after_selinux_complete_init) < 0)
+                pr_warn("[selinux_hook] selinux_complete_init hook failed\n");
         }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_complete_init\n");
@@ -4512,8 +4623,9 @@ static long init(const char *args, const char *event, void *__user r)
             int argc = selinux_compat_call_needed() ? 2 : 1;
 
             pr_info("[selinux_hook] hook selinux_policy_commit argc=%d\n", argc);
-            install_inline_hook((void *)addr, argc, NULL,
-                                after_selinux_policy_commit);
+            if (install_inline_hook((void *)addr, argc, NULL,
+                                    after_selinux_policy_commit) < 0)
+                pr_warn("[selinux_hook] selinux_policy_commit hook failed\n");
         }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_policy_commit\n");
