@@ -26,7 +26,7 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.6"
+#define SELINUX_VERSION "1.1.6.1"
 #endif
 KPM_VERSION(SELINUX_VERSION);
 KPM_LICENSE("All rights reserved.");
